@@ -1,0 +1,3 @@
+# Normalize to LF everywhere (shell scripts and Docker files must not get CRLF on Windows checkouts)
+* text=auto eol=lf
+*.png binary

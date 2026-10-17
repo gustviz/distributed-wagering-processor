@@ -1,0 +1,91 @@
+# Local stack: PostgreSQL + SQS emulator + 3 application replicas behind nginx.
+#
+#   docker compose up -d --build          # everything (API on http://localhost:3000)
+#   docker compose up -d postgres sqs     # infrastructure only (for `bun test`)
+#
+# SQS emulator: LocalStack is pinned to 4.14.0, the last release that runs without
+# an auth token. To use MiniStack instead: SQS_EMULATOR_IMAGE=ministackorg/ministack:1.5.27
+name: wagering
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/wagering
+  AWS_ENDPOINT_URL: http://sqs:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  LOG_LEVEL: info
+  DB_POOL_MAX: "20"
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wagering
+    ports:
+      - "5433:5432" # 5433 on the host to avoid clashing with a local PostgreSQL
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  sqs:
+    image: ${SQS_EMULATOR_IMAGE:-localstack/localstack:4.14.0}
+    environment:
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || wget -qO- http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # One-shot: versioned migrations (reversible: `bun run migrate:down`).
+  migrate:
+    build: .
+    command: ["bun", "run", "src/infrastructure/persistence/migrate.ts", "up"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # One-shot: FIFO queues + DLQ redrive policy.
+  queues:
+    build: .
+    command: ["bun", "run", "scripts/create-queues.ts"]
+    environment: *app-env
+    depends_on:
+      sqs:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    build: .
+    environment: *app-env
+    deploy:
+      replicas: 3 # ≥ 3 instances share the database, queue and outbox
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      queues:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./infra/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "3000:80"
+    depends_on:
+      - app
+
+volumes:
+  pgdata:
